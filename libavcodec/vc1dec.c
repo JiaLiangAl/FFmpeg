@@ -29,7 +29,7 @@
 #include "avcodec.h"
 #include "blockdsp.h"
 #include "get_bits.h"
-#include "hwaccel.h"
+#include "hwconfig.h"
 #include "internal.h"
 #include "mpeg_er.h"
 #include "mpegvideo.h"
@@ -384,7 +384,7 @@ av_cold int ff_vc1_decode_init_alloc_tables(VC1Context *v)
     if (s->avctx->codec_id == AV_CODEC_ID_WMV3IMAGE || s->avctx->codec_id == AV_CODEC_ID_VC1IMAGE) {
         for (i = 0; i < 4; i++)
             if (!(v->sr_rows[i >> 1][i & 1] = av_malloc(v->output_width)))
-                return AVERROR(ENOMEM);
+                goto error;
     }
 
     ret = ff_intrax8_common_init(s->avctx, &v->x8, &s->idsp,
@@ -434,8 +434,7 @@ static av_cold int vc1_decode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     v->s.avctx = avctx;
 
-    if ((ret = ff_vc1_init_common(v)) < 0)
-        return ret;
+    ff_vc1_init_common(v);
 
     if (avctx->codec_id == AV_CODEC_ID_WMV3 || avctx->codec_id == AV_CODEC_ID_WMV3IMAGE) {
         int count = 0;
@@ -539,12 +538,6 @@ static av_cold int vc1_decode_init(AVCodecContext *avctx)
     ff_h264chroma_init(&v->h264chroma, 8);
     ff_qpeldsp_init(&s->qdsp);
 
-    // Must happen after calling ff_vc1_decode_end
-    // to avoid de-allocating the sprite_output_frame
-    v->sprite_output_frame = av_frame_alloc();
-    if (!v->sprite_output_frame)
-        return AVERROR(ENOMEM);
-
     avctx->has_b_frames = !!avctx->max_b_frames;
 
     if (v->color_prim == 1 || v->color_prim == 5 || v->color_prim == 6)
@@ -577,20 +570,15 @@ static av_cold int vc1_decode_init(AVCodecContext *avctx)
             v->sprite_height > 1 << 14 ||
             v->output_width  > 1 << 14 ||
             v->output_height > 1 << 14) {
-            ret = AVERROR_INVALIDDATA;
-            goto error;
+            return AVERROR_INVALIDDATA;
         }
 
         if ((v->sprite_width&1) || (v->sprite_height&1)) {
             avpriv_request_sample(avctx, "odd sprites support");
-            ret = AVERROR_PATCHWELCOME;
-            goto error;
+            return AVERROR_PATCHWELCOME;
         }
     }
     return 0;
-error:
-    av_frame_free(&v->sprite_output_frame);
-    return ret;
 }
 
 /** Close a VC1/WMV3 decoder
@@ -605,8 +593,6 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
 
     for (i = 0; i < 4; i++)
         av_freep(&v->sr_rows[i >> 1][i & 1]);
-    av_freep(&v->hrd_rate);
-    av_freep(&v->hrd_buffer);
     ff_mpv_common_end(&v->s);
     av_freep(&v->mv_type_mb_plane);
     av_freep(&v->direct_mb_plane);
@@ -701,7 +687,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, void *data,
                         goto err;
                     }
                     slices = tmp;
-                    slices[n_slices].buf = av_mallocz(buf_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                    slices[n_slices].buf = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
                     if (!slices[n_slices].buf) {
                         ret = AVERROR(ENOMEM);
                         goto err;
@@ -730,7 +716,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, void *data,
                         goto err;
                     }
                     slices = tmp;
-                    slices[n_slices].buf = av_mallocz(buf_size + AV_INPUT_BUFFER_PADDING_SIZE);
+                    slices[n_slices].buf = av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE);
                     if (!slices[n_slices].buf) {
                         ret = AVERROR(ENOMEM);
                         goto err;
@@ -854,7 +840,12 @@ static int vc1_decode_frame(AVCodecContext *avctx, void *data,
         ret = AVERROR_INVALIDDATA;
         goto err;
     }
-
+    if ((avctx->codec_id == AV_CODEC_ID_WMV3IMAGE || avctx->codec_id == AV_CODEC_ID_VC1IMAGE)
+        && v->field_mode) {
+        av_log(v->s.avctx, AV_LOG_ERROR, "Sprite decoder: expected Frames not Fields\n");
+        ret = AVERROR_INVALIDDATA;
+        goto err;
+    }
     if ((s->mb_height >> v->field_mode) == 0) {
         av_log(v->s.avctx, AV_LOG_ERROR, "image too short\n");
         ret = AVERROR_INVALIDDATA;
@@ -1033,7 +1024,6 @@ static int vc1_decode_frame(AVCodecContext *avctx, void *data,
 
         ff_mpeg_er_frame_start(s);
 
-        v->bits = buf_size * 8;
         v->end_mb_x = s->mb_width;
         if (v->field_mode) {
             s->current_picture.f->linesize[0] <<= 1;
@@ -1107,8 +1097,9 @@ static int vc1_decode_frame(AVCodecContext *avctx, void *data,
                 continue;
             }
             ff_vc1_decode_blocks(v);
-            if (i != n_slices)
+            if (i != n_slices) {
                 s->gb = slices[i].gb;
+            }
         }
         if (v->field_mode) {
             v->second_field = 0;
@@ -1142,6 +1133,11 @@ image:
         avctx->height = avctx->coded_height = v->output_height;
         if (avctx->skip_frame >= AVDISCARD_NONREF)
             goto end;
+        if (!v->sprite_output_frame &&
+            !(v->sprite_output_frame = av_frame_alloc())) {
+            ret = AVERROR(ENOMEM);
+            goto err;
+        }
 #if CONFIG_WMV3IMAGE_DECODER || CONFIG_VC1IMAGE_DECODER
         if ((ret = vc1_decode_sprites(v, &s->gb)) < 0)
             goto err;
@@ -1200,7 +1196,7 @@ static const enum AVPixelFormat vc1_hwaccel_pixfmt_list_420[] = {
     AV_PIX_FMT_NONE
 };
 
-AVCodec ff_vc1_decoder = {
+const AVCodec ff_vc1_decoder = {
     .name           = "vc1",
     .long_name      = NULL_IF_CONFIG_SMALL("SMPTE VC-1"),
     .type           = AVMEDIA_TYPE_VIDEO,
@@ -1212,7 +1208,7 @@ AVCodec ff_vc1_decoder = {
     .flush          = ff_mpeg_flush,
     .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     .pix_fmts       = vc1_hwaccel_pixfmt_list_420,
-    .hw_configs     = (const AVCodecHWConfigInternal*[]) {
+    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_VC1_DXVA2_HWACCEL
                         HWACCEL_DXVA2(vc1),
 #endif
@@ -1237,7 +1233,7 @@ AVCodec ff_vc1_decoder = {
 };
 
 #if CONFIG_WMV3_DECODER
-AVCodec ff_wmv3_decoder = {
+const AVCodec ff_wmv3_decoder = {
     .name           = "wmv3",
     .long_name      = NULL_IF_CONFIG_SMALL("Windows Media Video 9"),
     .type           = AVMEDIA_TYPE_VIDEO,
@@ -1249,7 +1245,7 @@ AVCodec ff_wmv3_decoder = {
     .flush          = ff_mpeg_flush,
     .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     .pix_fmts       = vc1_hwaccel_pixfmt_list_420,
-    .hw_configs     = (const AVCodecHWConfigInternal*[]) {
+    .hw_configs     = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_WMV3_DXVA2_HWACCEL
                         HWACCEL_DXVA2(wmv3),
 #endif
@@ -1275,7 +1271,7 @@ AVCodec ff_wmv3_decoder = {
 #endif
 
 #if CONFIG_WMV3IMAGE_DECODER
-AVCodec ff_wmv3image_decoder = {
+const AVCodec ff_wmv3image_decoder = {
     .name           = "wmv3image",
     .long_name      = NULL_IF_CONFIG_SMALL("Windows Media Video 9 Image"),
     .type           = AVMEDIA_TYPE_VIDEO,
@@ -1294,7 +1290,7 @@ AVCodec ff_wmv3image_decoder = {
 #endif
 
 #if CONFIG_VC1IMAGE_DECODER
-AVCodec ff_vc1image_decoder = {
+const AVCodec ff_vc1image_decoder = {
     .name           = "vc1image",
     .long_name      = NULL_IF_CONFIG_SMALL("Windows Media Video 9 Image v2"),
     .type           = AVMEDIA_TYPE_VIDEO,

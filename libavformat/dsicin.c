@@ -200,7 +200,6 @@ static int cin_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         ret = avio_read(pb, &pkt->data[4], pkt_size);
         if (ret < 0) {
-            av_packet_unref(pkt);
             return ret;
         }
         if (ret < pkt_size)
@@ -224,7 +223,7 @@ static int cin_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-AVInputFormat ff_dsicin_demuxer = {
+const AVInputFormat ff_dsicin_demuxer = {
     .name           = "dsicin",
     .long_name      = NULL_IF_CONFIG_SMALL("Delphine Software International CIN"),
     .priv_data_size = sizeof(CinDemuxContext),

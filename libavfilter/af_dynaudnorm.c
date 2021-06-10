@@ -521,10 +521,11 @@ static void update_gain_history(DynamicAudioNormalizerContext *s, int channel,
     }
 
     while (cqueue_size(s->gain_history_minimum[channel]) >= s->filter_size) {
-        double smoothed;
+        double smoothed, limit;
 
         smoothed = gaussian_filter(s, s->gain_history_minimum[channel], s->threshold_history[channel]);
-        smoothed = FFMIN(smoothed, cqueue_peek(s->gain_history_minimum[channel], s->filter_size / 2));
+        limit    = cqueue_peek(s->gain_history_original[channel], 0);
+        smoothed = FFMIN(smoothed, limit);
 
         cqueue_enqueue(s->gain_history_smoothed[channel], smoothed);
 
@@ -718,6 +719,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         cqueue_dequeue(s->is_enabled, &is_enabled);
 
         amplify_frame(s, out, is_enabled > 0.);
+        s->pts = out->pts + out->nb_samples;
         ret = ff_filter_frame(outlink, out);
     }
 
@@ -768,7 +770,7 @@ static int flush(AVFilterLink *outlink)
     } else if (s->queue.available) {
         AVFrame *out = ff_bufqueue_get(&s->queue);
 
-        s->pts = out->pts;
+        s->pts = out->pts + out->nb_samples;
         ret = ff_filter_frame(outlink, out);
     }
 
@@ -796,7 +798,7 @@ static int activate(AVFilterContext *ctx)
                 return ret;
         }
 
-        if (ff_inlink_queued_samples(inlink) >= s->frame_len) {
+        if (ff_inlink_check_available_samples(inlink, s->frame_len) > 0) {
             ff_filter_set_ready(ctx, 10);
             return 0;
         }
@@ -866,7 +868,7 @@ static const AVFilterPad avfilter_af_dynaudnorm_outputs[] = {
     { NULL }
 };
 
-AVFilter ff_af_dynaudnorm = {
+const AVFilter ff_af_dynaudnorm = {
     .name          = "dynaudnorm",
     .description   = NULL_IF_CONFIG_SMALL("Dynamic Audio Normalizer."),
     .query_formats = query_formats,

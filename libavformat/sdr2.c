@@ -51,7 +51,7 @@ static int sdr2_read_header(AVFormatContext *s)
     st->codecpar->width      = avio_rl32(s->pb);
     st->codecpar->height     = avio_rl32(s->pb);
     st->codecpar->codec_id   = AV_CODEC_ID_H264;
-    st->need_parsing      = AVSTREAM_PARSE_FULL;
+    st->internal->need_parsing      = AVSTREAM_PARSE_FULL;
 
     ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
     ast->codecpar->channels    = 1;
@@ -95,7 +95,6 @@ static int sdr2_read_packet(AVFormatContext *s, AVPacket *pkt)
         memcpy(pkt->data, header, 24);
         ret = avio_read(s->pb, pkt->data + 24, next - 52);
         if (ret < 0) {
-            av_packet_unref(pkt);
             return ret;
         }
         av_shrink_packet(pkt, ret + 24);
@@ -110,7 +109,7 @@ static int sdr2_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-AVInputFormat ff_sdr2_demuxer = {
+const AVInputFormat ff_sdr2_demuxer = {
     .name        = "sdr2",
     .long_name   = NULL_IF_CONFIG_SMALL("SDR2"),
     .read_probe  = sdr2_probe,

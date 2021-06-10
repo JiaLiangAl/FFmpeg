@@ -375,25 +375,6 @@ const char *avio_find_protocol_name(const char *url);
 int avio_check(const char *url, int flags);
 
 /**
- * Move or rename a resource.
- *
- * @note url_src and url_dst should share the same protocol and authority.
- *
- * @param url_src url to resource to be moved
- * @param url_dst new url to resource if the operation succeeded
- * @return >=0 on success or negative on error.
- */
-int avpriv_io_move(const char *url_src, const char *url_dst);
-
-/**
- * Delete a resource.
- *
- * @param url resource to be deleted.
- * @return >=0 on success or negative on error.
- */
-int avpriv_io_delete(const char *url);
-
-/**
  * Open directory for reading.
  *
  * @param s       directory read context. Pointer to a NULL pointer must be passed.
@@ -806,6 +787,13 @@ int avio_close_dyn_buf(AVIOContext *s, uint8_t **pbuffer);
  * @return A static string containing the name of current protocol or NULL
  */
 const char *avio_enum_protocols(void **opaque, int output);
+
+/**
+ * Get AVClass by names of available protocols.
+ *
+ * @return A AVClass of input protocol name or NULL
+ */
+const AVClass *avio_protocol_get_class(const char *name);
 
 /**
  * Pause and resume playing - only meaningful if using a network streaming

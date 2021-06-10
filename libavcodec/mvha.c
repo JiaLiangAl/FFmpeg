@@ -233,6 +233,8 @@ static int decode_frame(AVCodecContext *avctx,
 
             dst = frame->data[p] + (avctx->height - 1) * frame->linesize[p];
             for (int y = 0; y < avctx->height; y++) {
+                if (get_bits_left(gb) < width)
+                    return AVERROR_INVALIDDATA;
                 for (int x = 0; x < width; x++) {
                     int v = get_vlc2(gb, s->vlc.table, s->vlc.bits, 3);
 
@@ -256,12 +258,14 @@ static int decode_frame(AVCodecContext *avctx,
 
         dst = frame->data[p] + (avctx->height - 1) * frame->linesize[p];
         s->llviddsp.add_left_pred(dst, dst, width, 0);
-        dst -= stride;
-        lefttop = left = dst[0];
-        for (int y = 1; y < avctx->height; y++) {
-            s->llviddsp.add_median_pred(dst, dst + stride, dst, width, &left, &lefttop);
-            lefttop = left = dst[0];
+        if (avctx->height > 1) {
             dst -= stride;
+            lefttop = left = dst[0];
+            for (int y = 1; y < avctx->height; y++) {
+                s->llviddsp.add_median_pred(dst, dst + stride, dst, width, &left, &lefttop);
+                lefttop = left = dst[0];
+                dst -= stride;
+            }
         }
     }
 
@@ -303,7 +307,7 @@ static av_cold int decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_mvha_decoder = {
+const AVCodec ff_mvha_decoder = {
     .name             = "mvha",
     .long_name        = NULL_IF_CONFIG_SMALL("MidiVid Archive Codec"),
     .type             = AVMEDIA_TYPE_VIDEO,

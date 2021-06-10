@@ -56,7 +56,7 @@ static uint8_t do_chromakey_pixel(ChromakeyContext *ctx, uint8_t u[9], uint8_t v
         du = (int)u[i] - ctx->chromakey_uv[0];
         dv = (int)v[i] - ctx->chromakey_uv[1];
 
-        diff += sqrt((du * du + dv * dv) / (255.0 * 255.0));
+        diff += sqrt((du * du + dv * dv) / (255.0 * 255.0 * 2));
     }
 
     diff /= 9.0;
@@ -78,7 +78,7 @@ static uint16_t do_chromakey_pixel16(ChromakeyContext *ctx, uint16_t u[9], uint1
         du = (int)u[i] - ctx->chromakey_uv[0];
         dv = (int)v[i] - ctx->chromakey_uv[1];
 
-        diff += sqrt((du * du + dv * dv) / (max * max));
+        diff += sqrt((du * du + dv * dv) / (max * max * 2));
     }
 
     diff /= 9.0;
@@ -389,7 +389,7 @@ static const AVFilterPad chromakey_outputs[] = {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption chromakey_options[] = {
-    { "color", "set the chromakey key color", OFFSET(chromakey_rgba), AV_OPT_TYPE_COLOR, { .str = "black" }, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "color", "set the chromakey key color", OFFSET(chromakey_rgba), AV_OPT_TYPE_COLOR, { .str = "black" }, 0, 0, FLAGS },
     { "similarity", "set the chromakey similarity value", OFFSET(similarity), AV_OPT_TYPE_FLOAT, { .dbl = 0.01 }, 0.01, 1.0, FLAGS },
     { "blend", "set the chromakey key blend value", OFFSET(blend), AV_OPT_TYPE_FLOAT, { .dbl = 0.0 }, 0.0, 1.0, FLAGS },
     { "yuv", "color parameter is in yuv instead of rgb", OFFSET(is_yuv), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
@@ -398,7 +398,7 @@ static const AVOption chromakey_options[] = {
 
 AVFILTER_DEFINE_CLASS(chromakey);
 
-AVFilter ff_vf_chromakey = {
+const AVFilter ff_vf_chromakey = {
     .name          = "chromakey",
     .description   = NULL_IF_CONFIG_SMALL("Turns a certain color into transparency. Operates on YUV colors."),
     .priv_size     = sizeof(ChromakeyContext),
@@ -411,7 +411,7 @@ AVFilter ff_vf_chromakey = {
 };
 
 static const AVOption chromahold_options[] = {
-    { "color", "set the chromahold key color", OFFSET(chromakey_rgba), AV_OPT_TYPE_COLOR, { .str = "black" }, CHAR_MIN, CHAR_MAX, FLAGS },
+    { "color", "set the chromahold key color", OFFSET(chromakey_rgba), AV_OPT_TYPE_COLOR, { .str = "black" }, 0, 0, FLAGS },
     { "similarity", "set the chromahold similarity value", OFFSET(similarity), AV_OPT_TYPE_FLOAT, { .dbl = 0.01 }, 0.01, 1.0, FLAGS },
     { "blend", "set the chromahold blend value", OFFSET(blend), AV_OPT_TYPE_FLOAT, { .dbl = 0.0 }, 0.0, 1.0, FLAGS },
     { "yuv", "color parameter is in yuv instead of rgb", OFFSET(is_yuv), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
@@ -440,7 +440,7 @@ static const AVFilterPad chromahold_outputs[] = {
 
 AVFILTER_DEFINE_CLASS(chromahold);
 
-AVFilter ff_vf_chromahold = {
+const AVFilter ff_vf_chromahold = {
     .name          = "chromahold",
     .description   = NULL_IF_CONFIG_SMALL("Turns a certain color range into gray."),
     .priv_size     = sizeof(ChromakeyContext),

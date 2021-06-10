@@ -29,9 +29,11 @@
 #include <vpx/vp8cx.h>
 
 #include "avcodec.h"
+#include "encode.h"
 #include "internal.h"
 #include "libavutil/avassert.h"
 #include "libvpx.h"
+#include "packet_internal.h"
 #include "profiles.h"
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
@@ -40,6 +42,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
+#include "libavutil/pixdesc.h"
 
 /**
  * Portion of struct vpx_codec_cx_pkt from vpx_encoder.h.
@@ -100,7 +103,9 @@ typedef struct VPxEncoderContext {
     int rc_undershoot_pct;
     int rc_overshoot_pct;
 
-    AVDictionary *vp8_ts_parameters;
+    AVDictionary *vpx_ts_parameters;
+    int *ts_layer_flags;
+    int current_temporal_idx;
 
     // VP9-only
     int lossless;
@@ -121,6 +126,9 @@ typedef struct VPxEncoderContext {
      * encounter a frame with ROI side data.
      */
     int roi_warned;
+#if CONFIG_LIBVPX_VP9_ENCODER && defined(VPX_CTRL_VP9E_SET_MAX_INTER_BITRATE_PCT)
+    vpx_svc_ref_frame_config_t ref_frame_config;
+#endif
 } VPxContext;
 
 /** String mappings for enum vp8e_enc_control_id */
@@ -137,6 +145,7 @@ static const char *const ctlidstr[] = {
     [VP8E_SET_CQ_LEVEL]          = "VP8E_SET_CQ_LEVEL",
     [VP8E_SET_MAX_INTRA_BITRATE_PCT] = "VP8E_SET_MAX_INTRA_BITRATE_PCT",
     [VP8E_SET_SHARPNESS]               = "VP8E_SET_SHARPNESS",
+    [VP8E_SET_TEMPORAL_LAYER_ID]       = "VP8E_SET_TEMPORAL_LAYER_ID",
 #if CONFIG_LIBVPX_VP9_ENCODER
     [VP9E_SET_LOSSLESS]                = "VP9E_SET_LOSSLESS",
     [VP9E_SET_TILE_COLUMNS]            = "VP9E_SET_TILE_COLUMNS",
@@ -144,6 +153,12 @@ static const char *const ctlidstr[] = {
     [VP9E_SET_FRAME_PARALLEL_DECODING] = "VP9E_SET_FRAME_PARALLEL_DECODING",
     [VP9E_SET_AQ_MODE]                 = "VP9E_SET_AQ_MODE",
     [VP9E_SET_COLOR_SPACE]             = "VP9E_SET_COLOR_SPACE",
+    [VP9E_SET_SVC_LAYER_ID]            = "VP9E_SET_SVC_LAYER_ID",
+#if VPX_ENCODER_ABI_VERSION >= 12
+    [VP9E_SET_SVC_PARAMETERS]          = "VP9E_SET_SVC_PARAMETERS",
+    [VP9E_SET_SVC_REF_FRAME_CONFIG]    = "VP9E_SET_SVC_REF_FRAME_CONFIG",
+#endif
+    [VP9E_SET_SVC]                     = "VP9E_SET_SVC",
 #if VPX_ENCODER_ABI_VERSION >= 11
     [VP9E_SET_COLOR_RANGE]             = "VP9E_SET_COLOR_RANGE",
 #endif
@@ -221,10 +236,22 @@ static av_cold void dump_enc_cfg(AVCodecContext *avctx,
            width, "rc_overshoot_pct:",  cfg->rc_overshoot_pct);
     av_log(avctx, level, "temporal layering settings\n"
            "  %*s%u\n", width, "ts_number_layers:", cfg->ts_number_layers);
-    av_log(avctx, level,
-           "\n  %*s", width, "ts_target_bitrate:");
-    for (i = 0; i < VPX_TS_MAX_LAYERS; i++)
-        av_log(avctx, level, "%u ", cfg->ts_target_bitrate[i]);
+    if (avctx->codec_id == AV_CODEC_ID_VP8) {
+        av_log(avctx, level,
+               "\n  %*s", width, "ts_target_bitrate:");
+        for (i = 0; i < VPX_TS_MAX_LAYERS; i++)
+            av_log(avctx, level,
+                   "%u ", cfg->ts_target_bitrate[i]);
+    }
+#if (VPX_ENCODER_ABI_VERSION >= 12) && CONFIG_LIBVPX_VP9_ENCODER
+    if (avctx->codec_id == AV_CODEC_ID_VP9) {
+        av_log(avctx, level,
+               "\n  %*s", width, "layer_target_bitrate:");
+        for (i = 0; i < VPX_TS_MAX_LAYERS; i++)
+            av_log(avctx, level,
+                   "%u ", cfg->layer_target_bitrate[i]);
+    }
+#endif
     av_log(avctx, level, "\n");
     av_log(avctx, level,
            "\n  %*s", width, "ts_rate_decimator:");
@@ -346,6 +373,8 @@ static av_cold int vpx_free(AVCodecContext *avctx)
     }
 #endif
 
+    av_freep(&ctx->ts_layer_flags);
+
     vpx_codec_destroy(&ctx->encoder);
     if (ctx->is_alpha) {
         vpx_codec_destroy(&ctx->encoder_alpha);
@@ -370,26 +399,246 @@ static void vp8_ts_parse_int_array(int *dest, char *value, size_t value_len, int
     }
 }
 
-static int vp8_ts_param_parse(struct vpx_codec_enc_cfg *enccfg, char *key, char *value)
+#if CONFIG_LIBVPX_VP9_ENCODER && defined(VPX_CTRL_VP9E_SET_MAX_INTER_BITRATE_PCT)
+static void vp8_ts_parse_int64_array(int64_t *dest, char *value, size_t value_len, int max_entries)
+{
+    int dest_idx = 0;
+    char *saveptr = NULL;
+    char *token = av_strtok(value, ",", &saveptr);
+
+    while (token && dest_idx < max_entries) {
+        dest[dest_idx++] = strtoull(token, NULL, 10);
+        token = av_strtok(NULL, ",", &saveptr);
+    }
+}
+#endif
+
+static void set_temporal_layer_pattern(int layering_mode, vpx_codec_enc_cfg_t *cfg,
+                                       int *layer_flags, int *flag_periodicity)
+{
+    switch (layering_mode) {
+    case 2: {
+        /**
+         * 2-layers, 2-frame period.
+         */
+        static const int ids[2] = { 0, 1 };
+        cfg->ts_periodicity = 2;
+        *flag_periodicity = 2;
+        cfg->ts_number_layers = 2;
+        cfg->ts_rate_decimator[0] = 2;
+        cfg->ts_rate_decimator[1] = 1;
+        memcpy(cfg->ts_layer_id, ids, sizeof(ids));
+
+        layer_flags[0] =
+             VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+             VP8_EFLAG_NO_UPD_GF | VP8_EFLAG_NO_UPD_ARF;
+        layer_flags[1] =
+            VP8_EFLAG_NO_UPD_ARF | VP8_EFLAG_NO_UPD_GF |
+            VP8_EFLAG_NO_UPD_LAST |
+            VP8_EFLAG_NO_REF_ARF | VP8_EFLAG_NO_REF_GF;
+        break;
+    }
+    case 3: {
+        /**
+         * 3-layers structure with one reference frame.
+         *  This works same as temporal_layering_mode 3.
+         *
+         * 3-layers, 4-frame period.
+         */
+        static const int ids[4] = { 0, 2, 1, 2 };
+        cfg->ts_periodicity = 4;
+        *flag_periodicity = 4;
+        cfg->ts_number_layers = 3;
+        cfg->ts_rate_decimator[0] = 4;
+        cfg->ts_rate_decimator[1] = 2;
+        cfg->ts_rate_decimator[2] = 1;
+        memcpy(cfg->ts_layer_id, ids, sizeof(ids));
+
+        /**
+         * 0=L, 1=GF, 2=ARF,
+         * Intra-layer prediction disabled.
+         */
+        layer_flags[0] =
+            VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_GF | VP8_EFLAG_NO_UPD_ARF;
+        layer_flags[1] =
+            VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_LAST | VP8_EFLAG_NO_UPD_GF |
+            VP8_EFLAG_NO_UPD_ARF;
+        layer_flags[2] =
+            VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_ARF | VP8_EFLAG_NO_UPD_LAST;
+        layer_flags[3] =
+            VP8_EFLAG_NO_REF_LAST | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_LAST | VP8_EFLAG_NO_UPD_GF |
+            VP8_EFLAG_NO_UPD_ARF;
+        break;
+    }
+    case 4: {
+        /**
+         * 3-layers structure.
+         * added dependency between the two TL2 frames (on top of case 3).
+         * 3-layers, 4-frame period.
+         */
+        static const int ids[4] = { 0, 2, 1, 2 };
+        cfg->ts_periodicity = 4;
+        *flag_periodicity = 4;
+        cfg->ts_number_layers = 3;
+        cfg->ts_rate_decimator[0] = 4;
+        cfg->ts_rate_decimator[1] = 2;
+        cfg->ts_rate_decimator[2] = 1;
+        memcpy(cfg->ts_layer_id, ids, sizeof(ids));
+
+        /**
+         * 0=L, 1=GF, 2=ARF, Intra-layer prediction disabled.
+         */
+        layer_flags[0] =
+            VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_GF | VP8_EFLAG_NO_UPD_ARF;
+        layer_flags[1] =
+            VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_LAST | VP8_EFLAG_NO_UPD_GF;
+        layer_flags[2] =
+            VP8_EFLAG_NO_REF_GF | VP8_EFLAG_NO_REF_ARF |
+            VP8_EFLAG_NO_UPD_ARF | VP8_EFLAG_NO_UPD_LAST;
+        layer_flags[3] =
+            VP8_EFLAG_NO_REF_LAST |
+            VP8_EFLAG_NO_UPD_LAST | VP8_EFLAG_NO_UPD_GF |
+            VP8_EFLAG_NO_UPD_ARF;
+        break;
+    }
+    default:
+        /**
+         * do not change the layer_flags or the flag_periodicity in this case;
+         * it might be that the code is using external flags to be used.
+         */
+        break;
+
+    }
+}
+
+static int vpx_ts_param_parse(VPxContext *ctx, struct vpx_codec_enc_cfg *enccfg,
+                              char *key, char *value, enum AVCodecID codec_id)
 {
     size_t value_len = strlen(value);
+    int ts_layering_mode = 0;
 
     if (!value_len)
         return -1;
 
     if (!strcmp(key, "ts_number_layers"))
         enccfg->ts_number_layers = strtoul(value, &value, 10);
-    else if (!strcmp(key, "ts_target_bitrate"))
-        vp8_ts_parse_int_array(enccfg->ts_target_bitrate, value, value_len, VPX_TS_MAX_LAYERS);
-    else if (!strcmp(key, "ts_rate_decimator"))
-      vp8_ts_parse_int_array(enccfg->ts_rate_decimator, value, value_len, VPX_TS_MAX_LAYERS);
-    else if (!strcmp(key, "ts_periodicity"))
+    else if (!strcmp(key, "ts_target_bitrate")) {
+        if (codec_id == AV_CODEC_ID_VP8)
+            vp8_ts_parse_int_array(enccfg->ts_target_bitrate, value, value_len, VPX_TS_MAX_LAYERS);
+#if (VPX_ENCODER_ABI_VERSION >= 12) && CONFIG_LIBVPX_VP9_ENCODER
+        if (codec_id == AV_CODEC_ID_VP9)
+            vp8_ts_parse_int_array(enccfg->layer_target_bitrate, value, value_len, VPX_TS_MAX_LAYERS);
+#endif
+    } else if (!strcmp(key, "ts_rate_decimator")) {
+        vp8_ts_parse_int_array(enccfg->ts_rate_decimator, value, value_len, VPX_TS_MAX_LAYERS);
+    } else if (!strcmp(key, "ts_periodicity")) {
         enccfg->ts_periodicity = strtoul(value, &value, 10);
-    else if (!strcmp(key, "ts_layer_id"))
+    } else if (!strcmp(key, "ts_layer_id")) {
         vp8_ts_parse_int_array(enccfg->ts_layer_id, value, value_len, VPX_TS_MAX_PERIODICITY);
+    } else if (!strcmp(key, "ts_layering_mode")) {
+        /* option for pre-defined temporal structures in function set_temporal_layer_pattern. */
+        ts_layering_mode = strtoul(value, &value, 4);
+    }
+
+#if (VPX_ENCODER_ABI_VERSION >= 12) && CONFIG_LIBVPX_VP9_ENCODER
+    enccfg->temporal_layering_mode = VP9E_TEMPORAL_LAYERING_MODE_BYPASS; // only bypass mode is supported for now.
+    enccfg->ss_number_layers = 1; // TODO: add spatial scalability support.
+#endif
+    if (ts_layering_mode) {
+        // make sure the ts_layering_mode comes at the end of the ts_parameter string to ensure that
+        // correct configuration is done.
+        ctx->ts_layer_flags = av_malloc_array(VPX_TS_MAX_PERIODICITY, sizeof(*ctx->ts_layer_flags));
+        set_temporal_layer_pattern(ts_layering_mode, enccfg, ctx->ts_layer_flags, &enccfg->ts_periodicity);
+    }
 
     return 0;
 }
+
+#if CONFIG_LIBVPX_VP9_ENCODER && defined(VPX_CTRL_VP9E_SET_MAX_INTER_BITRATE_PCT)
+static int vpx_ref_frame_config_set_value(vpx_svc_ref_frame_config_t *ref_frame_config,
+                                          int ss_number_layers, char *key, char *value)
+{
+    size_t value_len = strlen(value);
+
+    if (!value_len)
+        return AVERROR(EINVAL);
+
+    if (!strcmp(key, "rfc_update_buffer_slot")) {
+        vp8_ts_parse_int_array(ref_frame_config->update_buffer_slot, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_update_last")) {
+        vp8_ts_parse_int_array(ref_frame_config->update_last, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_update_golden")) {
+        vp8_ts_parse_int_array(ref_frame_config->update_golden, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_update_alt_ref")) {
+        vp8_ts_parse_int_array(ref_frame_config->update_alt_ref, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_lst_fb_idx")) {
+        vp8_ts_parse_int_array(ref_frame_config->lst_fb_idx, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_gld_fb_idx")) {
+        vp8_ts_parse_int_array(ref_frame_config->gld_fb_idx, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_alt_fb_idx")) {
+        vp8_ts_parse_int_array(ref_frame_config->alt_fb_idx, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_reference_last")) {
+        vp8_ts_parse_int_array(ref_frame_config->reference_last, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_reference_golden")) {
+        vp8_ts_parse_int_array(ref_frame_config->reference_golden, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_reference_alt_ref")) {
+        vp8_ts_parse_int_array(ref_frame_config->reference_alt_ref, value, value_len, ss_number_layers);
+    } else if (!strcmp(key, "rfc_reference_duration")) {
+        vp8_ts_parse_int64_array(ref_frame_config->duration, value, value_len, ss_number_layers);
+    }
+
+    return 0;
+}
+
+static int vpx_parse_ref_frame_config_element(vpx_svc_ref_frame_config_t *ref_frame_config,
+                                              int ss_number_layers, const char **buf)
+{
+    const char key_val_sep[] = "=";
+    const char pairs_sep[] = ":";
+    char *key = av_get_token(buf, key_val_sep);
+    char *val = NULL;
+    int ret;
+
+    if (key && *key && strspn(*buf, key_val_sep)) {
+        (*buf)++;
+        val = av_get_token(buf, pairs_sep);
+    }
+
+    if (key && *key && val && *val)
+        ret = vpx_ref_frame_config_set_value(ref_frame_config, ss_number_layers, key, val);
+    else
+        ret = AVERROR(EINVAL);
+
+    av_freep(&key);
+    av_freep(&val);
+
+    return ret;
+}
+
+static int vpx_parse_ref_frame_config(vpx_svc_ref_frame_config_t *ref_frame_config,
+                                      int ss_number_layers, const char *str)
+{
+    int ret = 0;
+
+    while (*str) {
+        ret =
+            vpx_parse_ref_frame_config_element(ref_frame_config, ss_number_layers, &str);
+        if (ret < 0)
+            return ret;
+
+        if (*str)
+            str++;
+    }
+
+    return ret;
+}
+#endif
 
 #if CONFIG_LIBVPX_VP9_ENCODER
 static int set_pix_fmt(AVCodecContext *avctx, vpx_codec_caps_t codec_caps,
@@ -397,7 +646,8 @@ static int set_pix_fmt(AVCodecContext *avctx, vpx_codec_caps_t codec_caps,
                        vpx_img_fmt_t *img_fmt)
 {
     VPxContext av_unused *ctx = avctx->priv_data;
-    enccfg->g_bit_depth = enccfg->g_input_bit_depth = 8;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(avctx->pix_fmt);
+    enccfg->g_bit_depth = enccfg->g_input_bit_depth = desc->comp[0].depth;
     switch (avctx->pix_fmt) {
     case AV_PIX_FMT_YUV420P:
     case AV_PIX_FMT_YUVA420P:
@@ -421,8 +671,6 @@ static int set_pix_fmt(AVCodecContext *avctx, vpx_codec_caps_t codec_caps,
     case AV_PIX_FMT_YUV420P10:
     case AV_PIX_FMT_YUV420P12:
         if (codec_caps & VPX_CODEC_CAP_HIGHBITDEPTH) {
-            enccfg->g_bit_depth = enccfg->g_input_bit_depth =
-                avctx->pix_fmt == AV_PIX_FMT_YUV420P10 ? 10 : 12;
             enccfg->g_profile = 2;
             *img_fmt = VPX_IMG_FMT_I42016;
             *flags |= VPX_CODEC_USE_HIGHBITDEPTH;
@@ -432,8 +680,6 @@ static int set_pix_fmt(AVCodecContext *avctx, vpx_codec_caps_t codec_caps,
     case AV_PIX_FMT_YUV422P10:
     case AV_PIX_FMT_YUV422P12:
         if (codec_caps & VPX_CODEC_CAP_HIGHBITDEPTH) {
-            enccfg->g_bit_depth = enccfg->g_input_bit_depth =
-                avctx->pix_fmt == AV_PIX_FMT_YUV422P10 ? 10 : 12;
             enccfg->g_profile = 3;
             *img_fmt = VPX_IMG_FMT_I42216;
             *flags |= VPX_CODEC_USE_HIGHBITDEPTH;
@@ -443,8 +689,6 @@ static int set_pix_fmt(AVCodecContext *avctx, vpx_codec_caps_t codec_caps,
     case AV_PIX_FMT_YUV440P10:
     case AV_PIX_FMT_YUV440P12:
         if (codec_caps & VPX_CODEC_CAP_HIGHBITDEPTH) {
-            enccfg->g_bit_depth = enccfg->g_input_bit_depth =
-                avctx->pix_fmt == AV_PIX_FMT_YUV440P10 ? 10 : 12;
             enccfg->g_profile = 3;
             *img_fmt = VPX_IMG_FMT_I44016;
             *flags |= VPX_CODEC_USE_HIGHBITDEPTH;
@@ -457,9 +701,6 @@ static int set_pix_fmt(AVCodecContext *avctx, vpx_codec_caps_t codec_caps,
     case AV_PIX_FMT_YUV444P10:
     case AV_PIX_FMT_YUV444P12:
         if (codec_caps & VPX_CODEC_CAP_HIGHBITDEPTH) {
-            enccfg->g_bit_depth = enccfg->g_input_bit_depth =
-                avctx->pix_fmt == AV_PIX_FMT_YUV444P10 ||
-                avctx->pix_fmt == AV_PIX_FMT_GBRP10 ? 10 : 12;
             enccfg->g_profile = 3;
             *img_fmt = VPX_IMG_FMT_I44416;
             *flags |= VPX_CODEC_USE_HIGHBITDEPTH;
@@ -590,7 +831,9 @@ static av_cold int vpx_init(AVCodecContext *avctx,
     vpx_img_fmt_t img_fmt = VPX_IMG_FMT_I420;
 #if CONFIG_LIBVPX_VP9_ENCODER
     vpx_codec_caps_t codec_caps = vpx_codec_get_caps(iface);
+    vpx_svc_extra_cfg_t svc_params;
 #endif
+    AVDictionaryEntry* en = NULL;
 
     av_log(avctx, AV_LOG_INFO, "%s\n", vpx_codec_version_str());
     av_log(avctx, AV_LOG_VERBOSE, "%s\n", vpx_codec_build_config());
@@ -648,6 +891,9 @@ static av_cold int vpx_init(AVCodecContext *avctx,
     if (avctx->bit_rate) {
         enccfg.rc_target_bitrate = av_rescale_rnd(avctx->bit_rate, 1, 1000,
                                                   AV_ROUND_NEAR_INF);
+#if CONFIG_LIBVPX_VP9_ENCODER
+        enccfg.ss_target_bitrate[0] = enccfg.rc_target_bitrate;
+#endif
     } else {
         // Set bitrate to default value. Also sets CRF to default if needed.
         set_vpx_defaults(avctx, &enccfg);
@@ -676,12 +922,6 @@ static av_cold int vpx_init(AVCodecContext *avctx,
         }
     }
 
-#if FF_API_PRIVATE_OPT
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (avctx->frame_skip_threshold)
-        ctx->drop_threshold = avctx->frame_skip_threshold;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     enccfg.rc_dropframe_thresh = ctx->drop_threshold;
 
     //0-100 (0 => CBR, 100 => VBR)
@@ -757,14 +997,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     enccfg.g_error_resilient = ctx->error_resilient || ctx->flags & VP8F_ERROR_RESILIENT;
 
-    if (CONFIG_LIBVPX_VP8_ENCODER && avctx->codec_id == AV_CODEC_ID_VP8) {
-        AVDictionaryEntry* en = NULL;
-        while ((en = av_dict_get(ctx->vp8_ts_parameters, "", en, AV_DICT_IGNORE_SUFFIX))) {
-            if (vp8_ts_param_parse(&enccfg, en->key, en->value) < 0)
-                av_log(avctx, AV_LOG_WARNING,
-                       "Error parsing option '%s = %s'.\n",
-                       en->key, en->value);
-        }
+    while ((en = av_dict_get(ctx->vpx_ts_parameters, "", en, AV_DICT_IGNORE_SUFFIX))) {
+        if (vpx_ts_param_parse(ctx, &enccfg, en->key, en->value, avctx->codec_id) < 0)
+            av_log(avctx, AV_LOG_WARNING,
+                   "Error parsing option '%s = %s'.\n",
+                   en->key, en->value);
     }
 
     dump_enc_cfg(avctx, &enccfg);
@@ -774,7 +1011,21 @@ FF_ENABLE_DEPRECATION_WARNINGS
         log_encoder_error(avctx, "Failed to initialize encoder");
         return AVERROR(EINVAL);
     }
-
+#if CONFIG_LIBVPX_VP9_ENCODER
+    if (avctx->codec_id == AV_CODEC_ID_VP9 && enccfg.ts_number_layers > 1) {
+        memset(&svc_params, 0, sizeof(svc_params));
+        for (int i = 0; i < enccfg.ts_number_layers; ++i) {
+            svc_params.max_quantizers[i] = enccfg.rc_max_quantizer;
+            svc_params.min_quantizers[i] = enccfg.rc_min_quantizer;
+        }
+        svc_params.scaling_factor_num[0] = enccfg.g_h;
+        svc_params.scaling_factor_den[0] = enccfg.g_h;
+#if VPX_ENCODER_ABI_VERSION >= 12
+        codecctl_int(avctx, VP9E_SET_SVC, 1);
+        codecctl_intp(avctx, VP9E_SET_SVC_PARAMETERS, (int *)&svc_params);
+#endif
+    }
+#endif
     if (ctx->is_alpha) {
         enccfg_alpha = enccfg;
         res = vpx_codec_enc_init(&ctx->encoder_alpha, iface, &enccfg_alpha, flags);
@@ -810,12 +1061,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
         codecctl_int(avctx, VP8E_SET_SHARPNESS, ctx->sharpness);
 
     if (CONFIG_LIBVPX_VP8_ENCODER && avctx->codec_id == AV_CODEC_ID_VP8) {
-#if FF_API_PRIVATE_OPT
-FF_DISABLE_DEPRECATION_WARNINGS
-        if (avctx->noise_reduction)
-            ctx->noise_sensitivity = avctx->noise_reduction;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
         codecctl_int(avctx, VP8E_SET_NOISE_SENSITIVITY, ctx->noise_sensitivity);
         codecctl_int(avctx, VP8E_SET_TOKEN_PARTITIONS,  av_log2(avctx->slices));
     }
@@ -929,69 +1174,42 @@ static inline void cx_pktcpy(struct FrameListData *dst,
 static int storeframe(AVCodecContext *avctx, struct FrameListData *cx_frame,
                       AVPacket *pkt)
 {
-    int ret = ff_alloc_packet2(avctx, pkt, cx_frame->sz, 0);
+    int ret = ff_get_encode_buffer(avctx, pkt, cx_frame->sz, 0);
     uint8_t *side_data;
-    if (ret >= 0) {
-        int pict_type;
-        memcpy(pkt->data, cx_frame->buf, pkt->size);
-        pkt->pts = pkt->dts = cx_frame->pts;
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-        avctx->coded_frame->pts       = cx_frame->pts;
-        avctx->coded_frame->key_frame = !!(cx_frame->flags & VPX_FRAME_IS_KEY);
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
+    int pict_type;
 
-        if (!!(cx_frame->flags & VPX_FRAME_IS_KEY)) {
-            pict_type = AV_PICTURE_TYPE_I;
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->coded_frame->pict_type = pict_type;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-            pkt->flags |= AV_PKT_FLAG_KEY;
-        } else {
-            pict_type = AV_PICTURE_TYPE_P;
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->coded_frame->pict_type = pict_type;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-        }
-
-        ff_side_data_set_encoder_stats(pkt, 0, cx_frame->sse + 1,
-                                       cx_frame->have_sse ? 3 : 0, pict_type);
-
-        if (cx_frame->have_sse) {
-            int i;
-            /* Beware of the Y/U/V/all order! */
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-            avctx->coded_frame->error[0] = cx_frame->sse[1];
-            avctx->coded_frame->error[1] = cx_frame->sse[2];
-            avctx->coded_frame->error[2] = cx_frame->sse[3];
-            avctx->coded_frame->error[3] = 0;    // alpha
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-            for (i = 0; i < 3; ++i) {
-                avctx->error[i] += cx_frame->sse[i + 1];
-            }
-            cx_frame->have_sse = 0;
-        }
-        if (cx_frame->sz_alpha > 0) {
-            side_data = av_packet_new_side_data(pkt,
-                                                AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
-                                                cx_frame->sz_alpha + 8);
-            if(!side_data) {
-                av_packet_unref(pkt);
-                av_free(pkt);
-                return AVERROR(ENOMEM);
-            }
-            AV_WB64(side_data, 1);
-            memcpy(side_data + 8, cx_frame->buf_alpha, cx_frame->sz_alpha);
-        }
-    } else {
+    if (ret < 0)
         return ret;
+
+    memcpy(pkt->data, cx_frame->buf, pkt->size);
+    pkt->pts = pkt->dts = cx_frame->pts;
+
+    if (!!(cx_frame->flags & VPX_FRAME_IS_KEY)) {
+        pict_type = AV_PICTURE_TYPE_I;
+        pkt->flags |= AV_PKT_FLAG_KEY;
+    } else {
+        pict_type = AV_PICTURE_TYPE_P;
+    }
+
+    ff_side_data_set_encoder_stats(pkt, 0, cx_frame->sse + 1,
+                                   cx_frame->have_sse ? 3 : 0, pict_type);
+
+    if (cx_frame->have_sse) {
+        /* Beware of the Y/U/V/all order! */
+        for (int i = 0; i < 3; ++i)
+            avctx->error[i] += cx_frame->sse[i + 1];
+        cx_frame->have_sse = 0;
+    }
+    if (cx_frame->sz_alpha > 0) {
+        side_data = av_packet_new_side_data(pkt,
+                                            AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL,
+                                            cx_frame->sz_alpha + 8);
+        if (!side_data) {
+            av_packet_unref(pkt);
+            return AVERROR(ENOMEM);
+        }
+        AV_WB64(side_data, 1);
+        memcpy(side_data + 8, cx_frame->buf_alpha, cx_frame->sz_alpha);
     }
     return pkt->size;
 }
@@ -1321,6 +1539,9 @@ static int vpx_encode(AVCodecContext *avctx, AVPacket *pkt,
     int64_t timestamp = 0;
     int res, coded_size;
     vpx_enc_frame_flags_t flags = 0;
+    const struct vpx_codec_enc_cfg *enccfg = ctx->encoder.config.enc;
+    vpx_svc_layer_id_t layer_id;
+    int layer_id_valid = 0;
 
     if (frame) {
         const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_REGIONS_OF_INTEREST);
@@ -1352,11 +1573,42 @@ static int vpx_encode(AVCodecContext *avctx, AVPacket *pkt,
 #endif
         if (frame->pict_type == AV_PICTURE_TYPE_I)
             flags |= VPX_EFLAG_FORCE_KF;
-        if (CONFIG_LIBVPX_VP8_ENCODER && avctx->codec_id == AV_CODEC_ID_VP8 && frame->metadata) {
+        if (frame->metadata) {
             AVDictionaryEntry* en = av_dict_get(frame->metadata, "vp8-flags", NULL, 0);
             if (en) {
                 flags |= strtoul(en->value, NULL, 10);
             }
+
+            memset(&layer_id, 0, sizeof(layer_id));
+
+            en = av_dict_get(frame->metadata, "temporal_id", NULL, 0);
+            if (en) {
+                layer_id.temporal_layer_id = strtoul(en->value, NULL, 10);
+#ifdef VPX_CTRL_VP9E_SET_MAX_INTER_BITRATE_PCT
+                layer_id.temporal_layer_id_per_spatial[0] = layer_id.temporal_layer_id;
+#endif
+                layer_id_valid = 1;
+            }
+#if CONFIG_LIBVPX_VP9_ENCODER && defined(VPX_CTRL_VP9E_SET_MAX_INTER_BITRATE_PCT)
+            en = av_dict_get(frame->metadata, "ref-frame-config", NULL, 0);
+
+            if (en) {
+                if (avctx->codec_id == AV_CODEC_ID_VP9) {
+                    int ret = vpx_parse_ref_frame_config(&ctx->ref_frame_config,
+                                                         enccfg->ss_number_layers, en->value);
+                    if (ret < 0) {
+                        av_log(avctx, AV_LOG_WARNING,
+                               "Error parsing ref_frame_config option %s.\n", en->value);
+                        return ret;
+                    }
+
+                    codecctl_intp(avctx, VP9E_SET_SVC_REF_FRAME_CONFIG, (int *)&ctx->ref_frame_config);
+                } else {
+                    av_log(avctx, AV_LOG_WARNING,
+                           "Ignoring ref-frame-config for a non-VP9 codec\n");
+                }
+            }
+#endif
         }
 
         if (sd) {
@@ -1366,6 +1618,42 @@ static int vpx_encode(AVCodecContext *avctx, AVPacket *pkt,
                 vp9_encode_set_roi(avctx, frame->width, frame->height, sd);
             }
         }
+    }
+
+    // this is for encoding with preset temporal layering patterns defined in
+    // set_temporal_layer_pattern function.
+    if (enccfg->ts_number_layers > 1 && ctx->ts_layer_flags) {
+        if (flags & VPX_EFLAG_FORCE_KF) {
+            // keyframe, reset temporal layering.
+            ctx->current_temporal_idx = 0;
+            flags = VPX_EFLAG_FORCE_KF;
+        } else {
+            flags = 0;
+        }
+
+        /* get the flags from the temporal layer configuration. */
+        flags |= ctx->ts_layer_flags[ctx->current_temporal_idx];
+
+        memset(&layer_id, 0, sizeof(layer_id));
+#if VPX_ENCODER_ABI_VERSION >= 12
+        layer_id.spatial_layer_id = 0;
+#endif
+        layer_id.temporal_layer_id = enccfg->ts_layer_id[ctx->current_temporal_idx];
+#ifdef VPX_CTRL_VP9E_SET_MAX_INTER_BITRATE_PCT
+        layer_id.temporal_layer_id_per_spatial[0] = layer_id.temporal_layer_id;
+#endif
+        layer_id_valid = 1;
+    }
+
+    if (layer_id_valid) {
+        if (avctx->codec_id == AV_CODEC_ID_VP8) {
+            codecctl_int(avctx, VP8E_SET_TEMPORAL_LAYER_ID, layer_id.temporal_layer_id);
+        }
+#if CONFIG_LIBVPX_VP9_ENCODER && VPX_ENCODER_ABI_VERSION >= 12
+        else if (avctx->codec_id == AV_CODEC_ID_VP9) {
+            codecctl_intp(avctx, VP9E_SET_SVC_LAYER_ID, (int *)&layer_id);
+        }
+#endif
     }
 
     res = vpx_codec_encode(&ctx->encoder, rawimg, timestamp,
@@ -1397,6 +1685,8 @@ static int vpx_encode(AVCodecContext *avctx, AVPacket *pkt,
         }
         av_base64_encode(avctx->stats_out, b64_size, ctx->twopass_stats.buf,
                          ctx->twopass_stats.sz);
+    } else if (enccfg->ts_number_layers > 1 && ctx->ts_layer_flags) {
+        ctx->current_temporal_idx = (ctx->current_temporal_idx + 1) % enccfg->ts_periodicity;
     }
 
     *got_packet = !!coded_size;
@@ -1435,6 +1725,7 @@ static int vpx_encode(AVCodecContext *avctx, AVPacket *pkt,
     { "noise-sensitivity", "Noise sensitivity", OFFSET(noise_sensitivity), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 4, VE}, \
     { "undershoot-pct",  "Datarate undershoot (min) target (%)", OFFSET(rc_undershoot_pct), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 100, VE }, \
     { "overshoot-pct",   "Datarate overshoot (max) target (%)", OFFSET(rc_overshoot_pct), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1000, VE }, \
+    { "ts-parameters",   "Temporal scaling configuration using a :-separated list of key=value parameters", OFFSET(vpx_ts_parameters), AV_OPT_TYPE_DICT, {.str=NULL},  0,  0, VE}, \
 
 #define LEGACY_OPTIONS \
     {"speed", "", offsetof(VPxContext, cpu_used), AV_OPT_TYPE_INT, {.i64 = 1}, -16, 16, VE}, \
@@ -1454,8 +1745,6 @@ static const AVOption vp8_options[] = {
     { "auto-alt-ref",    "Enable use of alternate reference "
                          "frames (2-pass only)",                        OFFSET(auto_alt_ref),    AV_OPT_TYPE_INT, {.i64 = -1}, -1,  2, VE},
     { "cpu-used",        "Quality/Speed ratio modifier",                OFFSET(cpu_used),        AV_OPT_TYPE_INT, {.i64 = 1}, -16, 16, VE},
-    { "ts-parameters",   "Temporal scaling configuration using a "
-                         ":-separated list of key=value parameters",    OFFSET(vp8_ts_parameters), AV_OPT_TYPE_DICT, {.str=NULL},  0,  0, VE},
     LEGACY_OPTIONS
     { NULL }
 };
@@ -1535,16 +1824,18 @@ static const AVClass class_vp8 = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVCodec ff_libvpx_vp8_encoder = {
+const AVCodec ff_libvpx_vp8_encoder = {
     .name           = "libvpx",
     .long_name      = NULL_IF_CONFIG_SMALL("libvpx VP8"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_VP8,
+    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_OTHER_THREADS,
     .priv_data_size = sizeof(VPxContext),
     .init           = vp8_init,
     .encode2        = vpx_encode,
     .close          = vpx_free,
-    .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AUTO_THREADS,
+    .caps_internal  = FF_CODEC_CAP_AUTO_THREADS,
     .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVA420P, AV_PIX_FMT_NONE },
     .priv_class     = &class_vp8,
     .defaults       = defaults,
@@ -1570,11 +1861,13 @@ AVCodec ff_libvpx_vp9_encoder = {
     .long_name      = NULL_IF_CONFIG_SMALL("libvpx VP9"),
     .type           = AVMEDIA_TYPE_VIDEO,
     .id             = AV_CODEC_ID_VP9,
+    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                      AV_CODEC_CAP_OTHER_THREADS,
     .priv_data_size = sizeof(VPxContext),
     .init           = vp9_init,
     .encode2        = vpx_encode,
     .close          = vpx_free,
-    .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AUTO_THREADS,
+    .caps_internal  = FF_CODEC_CAP_AUTO_THREADS,
     .profiles       = NULL_IF_CONFIG_SMALL(ff_vp9_profiles),
     .priv_class     = &class_vp9,
     .defaults       = defaults,

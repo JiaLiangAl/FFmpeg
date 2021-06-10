@@ -61,12 +61,16 @@ enum MetadataFunction {
 static const char *const var_names[] = {
     "VALUE1",
     "VALUE2",
+    "FRAMEVAL",
+    "USERVAL",
     NULL
 };
 
 enum var_name {
     VAR_VALUE1,
     VAR_VALUE2,
+    VAR_FRAMEVAL,
+    VAR_USERVAL,
     VAR_VARS_NB
 };
 
@@ -88,6 +92,8 @@ typedef struct MetadataContext {
     int (*compare)(struct MetadataContext *s,
                    const char *value1, const char *value2);
     void (*print)(AVFilterContext *ctx, const char *msg, ...) av_printf_format(2, 3);
+
+    int direct;    // reduces buffering when printing to user-supplied URL
 } MetadataContext;
 
 #define OFFSET(x) offsetof(MetadataContext, x)
@@ -111,6 +117,7 @@ static const AVOption filt_name##_options[] = { \
     {   "ends_with",   NULL, 0, AV_OPT_TYPE_CONST, {.i64 = METADATAF_ENDS_WITH },   0, 0, FLAGS, "function" }, \
     { "expr", "set expression for expr function", OFFSET(expr_str), AV_OPT_TYPE_STRING, {.str = NULL }, 0, 0, FLAGS }, \
     { "file", "set file where to print metadata information", OFFSET(file_str), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS }, \
+    { "direct", "reduce buffering when printing to user-set file or pipe", OFFSET(direct), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS }, \
     { NULL } \
 }
 
@@ -169,8 +176,8 @@ static int parse_expr(MetadataContext *s, const char *value1, const char *value2
     if (sscanf(value1, "%lf", &f1) + sscanf(value2, "%lf", &f2) != 2)
         return 0;
 
-    s->var_values[VAR_VALUE1] = f1;
-    s->var_values[VAR_VALUE2] = f2;
+    s->var_values[VAR_VALUE1] = s->var_values[VAR_FRAMEVAL] = f1;
+    s->var_values[VAR_VALUE2] = s->var_values[VAR_USERVAL]  = f2;
 
     return av_expr_eval(s->expr, s->var_values, NULL);
 }
@@ -274,6 +281,9 @@ static av_cold int init(AVFilterContext *ctx)
                    s->file_str, buf);
             return ret;
         }
+
+        if (s->direct)
+            s->avio_context->direct = AVIO_FLAG_DIRECT;
     }
 
     return 0;
@@ -298,7 +308,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     AVDictionary **metadata = &frame->metadata;
     AVDictionaryEntry *e;
 
-    if (!*metadata)
+    if (!*metadata && s->mode != METADATA_ADD)
         return ff_filter_frame(outlink, frame);
 
     e = av_dict_get(*metadata, !s->key ? "" : s->key, NULL,
@@ -377,7 +387,7 @@ static const AVFilterPad aoutputs[] = {
     { NULL }
 };
 
-AVFilter ff_af_ametadata = {
+const AVFilter ff_af_ametadata = {
     .name          = "ametadata",
     .description   = NULL_IF_CONFIG_SMALL("Manipulate audio frame metadata."),
     .priv_size     = sizeof(MetadataContext),
@@ -412,7 +422,7 @@ static const AVFilterPad outputs[] = {
     { NULL }
 };
 
-AVFilter ff_vf_metadata = {
+const AVFilter ff_vf_metadata = {
     .name        = "metadata",
     .description = NULL_IF_CONFIG_SMALL("Manipulate video frame metadata."),
     .priv_size   = sizeof(MetadataContext),

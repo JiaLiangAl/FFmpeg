@@ -412,8 +412,6 @@ static int decode_wmv9(AVCodecContext *avctx, const uint8_t *buf, int buf_size,
 
     ff_mpeg_er_frame_start(s);
 
-    v->bits = buf_size * 8;
-
     v->end_mb_x = (w + 15) >> 4;
     s->end_mb_y = (h + 15) >> 4;
     if (v->respic & 1)
@@ -753,9 +751,7 @@ static av_cold int wmv9_init(AVCodecContext *avctx)
 
     v->s.avctx    = avctx;
 
-    if ((ret = ff_vc1_init_common(v)) < 0)
-        return ret;
-    ff_vc1dsp_init(&v->vc1dsp);
+    ff_vc1_init_common(v);
 
     v->profile = PROFILE_MAIN;
 
@@ -849,7 +845,7 @@ static av_cold int mss2_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-AVCodec ff_mss2_decoder = {
+const AVCodec ff_mss2_decoder = {
     .name           = "mss2",
     .long_name      = NULL_IF_CONFIG_SMALL("MS Windows Media Video V9 Screen"),
     .type           = AVMEDIA_TYPE_VIDEO,

@@ -313,7 +313,8 @@ static int activate(AVFilterContext *ctx)
                                                FFMIN(s->planeheight[2],
                                                ff_filter_get_nb_threads(ctx)));
                     }
-                }
+                } else
+                    av_frame_free(&out);
             } else if (!out) {
                 ret = AVERROR(ENOMEM);
             }
@@ -400,7 +401,7 @@ static const AVFilterPad outputs[] = {
 
 AVFILTER_DEFINE_CLASS(dedot);
 
-AVFilter ff_vf_dedot = {
+const AVFilter ff_vf_dedot = {
     .name          = "dedot",
     .description   = NULL_IF_CONFIG_SMALL("Reduce cross-luminance and cross-color."),
     .priv_size     = sizeof(DedotContext),

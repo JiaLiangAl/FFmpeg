@@ -125,7 +125,7 @@ static int scale_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
 
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
-        return err;
+        goto fail;
 
     if (ctx->colour_primaries != AVCOL_PRI_UNSPECIFIED)
         output_frame->color_primaries = ctx->colour_primaries;
@@ -283,7 +283,7 @@ static const AVFilterPad scale_vaapi_outputs[] = {
     { NULL }
 };
 
-AVFilter ff_vf_scale_vaapi = {
+const AVFilter ff_vf_scale_vaapi = {
     .name          = "scale_vaapi",
     .description   = NULL_IF_CONFIG_SMALL("Scale to/from VAAPI surfaces."),
     .priv_size     = sizeof(ScaleVAAPIContext),

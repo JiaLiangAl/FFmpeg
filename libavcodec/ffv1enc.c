@@ -31,9 +31,9 @@
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
-#include "libavutil/timer.h"
 
 #include "avcodec.h"
+#include "encode.h"
 #include "internal.h"
 #include "put_bits.h"
 #include "rangecoder.h"
@@ -287,7 +287,6 @@ static int encode_plane(FFV1Context *s, uint8_t *src, int w, int h,
 
         sample[0][-1]= sample[1][0  ];
         sample[1][ w]= sample[1][w-1];
-// { START_TIMER
         if (s->bits_per_raw_sample <= 8) {
             for (x = 0; x < w; x++)
                 sample[0][x] = src[x * pixel_stride + stride * y];
@@ -306,7 +305,6 @@ static int encode_plane(FFV1Context *s, uint8_t *src, int w, int h,
             if((ret = encode_line(s, w, sample, plane_index, s->bits_per_raw_sample)) < 0)
                 return ret;
         }
-// STOP_TIMER("encode line") }
     }
     return 0;
 }
@@ -557,13 +555,6 @@ static av_cold int encode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
 
-#if FF_API_CODER_TYPE
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (avctx->coder_type != -1)
-        s->ac = avctx->coder_type > 0 ? AC_RANGE_CUSTOM_TAB : AC_GOLOMB_RICE;
-    else
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
     if (s->ac == 1) // Compatbility with common command line usage
         s->ac = AC_RANGE_CUSTOM_TAB;
     else if (s->ac == AC_RANGE_DEFAULT_TAB_FORCE)
@@ -706,16 +697,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
             s->ac = AC_RANGE_CUSTOM_TAB;
         }
     }
-#if FF_API_PRIVATE_OPT
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (avctx->context_model)
-        s->context_model = avctx->context_model;
-    if (avctx->context_model > 1U) {
-        av_log(avctx, AV_LOG_ERROR, "Invalid context model %d, valid values are 0 and 1\n", avctx->context_model);
-        return AVERROR(EINVAL);
-    }
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     if (s->ac == AC_RANGE_CUSTOM_TAB) {
         for (i = 1; i < 256; i++)
@@ -764,12 +745,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     if ((ret = ff_ffv1_allocate_initial_states(s)) < 0)
         return ret;
-
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     if (!s->transparency)
         s->plane_count = 2;
@@ -1185,7 +1160,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         maxsize = INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE - 32;
     }
 
-    if ((ret = ff_alloc_packet2(avctx, pkt, maxsize, 0)) < 0)
+    if ((ret = ff_alloc_packet(avctx, pkt, maxsize)) < 0)
         return ret;
 
     ff_init_range_encoder(c, pkt->data, pkt->size);
@@ -1194,11 +1169,6 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     av_frame_unref(p);
     if ((ret = av_frame_ref(p, pict)) < 0)
         return ret;
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-    avctx->coded_frame->pict_type = AV_PICTURE_TYPE_I;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     if (avctx->gop_size == 0 || f->picture_number % avctx->gop_size == 0) {
         put_rac(c, &keystate, 1);
@@ -1242,7 +1212,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
             bytes = ff_rac_terminate(&fs->c, 1);
         } else {
             flush_put_bits(&fs->pb); // FIXME: nicer padding
-            bytes = fs->ac_byte_count + (put_bits_count(&fs->pb) + 7) / 8;
+            bytes = fs->ac_byte_count + put_bytes_output(&fs->pb);
         }
         if (i > 0 || f->version > 2) {
             av_assert0(bytes < pkt->size / f->slice_count);
@@ -1263,12 +1233,6 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     if (avctx->flags & AV_CODEC_FLAG_PASS1)
         avctx->stats_out[0] = '\0';
-
-#if FF_API_CODED_FRAME
-FF_DISABLE_DEPRECATION_WARNINGS
-    avctx->coded_frame->key_frame = f->key_frame;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     f->picture_number++;
     pkt->size   = buf_p - pkt->data;
@@ -1313,14 +1277,7 @@ static const AVClass ffv1_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-#if FF_API_CODER_TYPE
-static const AVCodecDefault ffv1_defaults[] = {
-    { "coder", "-1" },
-    { NULL },
-};
-#endif
-
-AVCodec ff_ffv1_encoder = {
+const AVCodec ff_ffv1_encoder = {
     .name           = "ffv1",
     .long_name      = NULL_IF_CONFIG_SMALL("FFmpeg video codec #1"),
     .type           = AVMEDIA_TYPE_VIDEO,
@@ -1353,8 +1310,6 @@ AVCodec ff_ffv1_encoder = {
         AV_PIX_FMT_NONE
 
     },
-#if FF_API_CODER_TYPE
-    .defaults       = ffv1_defaults,
-#endif
     .priv_class     = &ffv1_class,
+    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
 };

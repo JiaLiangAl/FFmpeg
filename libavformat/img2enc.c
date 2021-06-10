@@ -23,6 +23,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
+#include "libavutil/dict.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
@@ -44,6 +45,7 @@ typedef struct VideoMuxData {
     int frame_pts;
     const char *muxer;
     int use_rename;
+    AVDictionary *protocol_opts;
 } VideoMuxData;
 
 static int write_header(AVFormatContext *s)
@@ -76,7 +78,7 @@ static int write_muxed_file(AVFormatContext *s, AVIOContext *pb, AVPacket *pkt)
     VideoMuxData *img = s->priv_data;
     AVCodecParameters *par = s->streams[pkt->stream_index]->codecpar;
     AVStream *st;
-    AVPacket pkt2 = {0};
+    AVPacket pkt2;
     AVFormatContext *fmt = NULL;
     int ret;
 
@@ -86,8 +88,8 @@ static int write_muxed_file(AVFormatContext *s, AVIOContext *pb, AVPacket *pkt)
         return ret;
     st = avformat_new_stream(fmt, NULL);
     if (!st) {
-        avformat_free_context(fmt);
-        return AVERROR(ENOMEM);
+        ret = AVERROR(ENOMEM);
+        goto out;
     }
     st->id = pkt->stream_index;
 
@@ -103,8 +105,8 @@ static int write_muxed_file(AVFormatContext *s, AVIOContext *pb, AVPacket *pkt)
         (ret = av_interleaved_write_frame(fmt, &pkt2))         < 0 ||
         (ret = av_write_trailer(fmt))) {}
 
-out:
     av_packet_unref(&pkt2);
+out:
     avformat_free_context(fmt);
     return ret;
 }
@@ -132,6 +134,7 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
     int ret, i;
     int nb_renames = 0;
+    AVDictionary *options = NULL;
 
     if (img->update) {
         av_strlcpy(filename, img->path, sizeof(filename));
@@ -160,11 +163,17 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR(EINVAL);
     }
     for (i = 0; i < 4; i++) {
+        av_dict_copy(&options, img->protocol_opts, 0);
         snprintf(img->tmp[i], sizeof(img->tmp[i]), "%s.tmp", filename);
         av_strlcpy(img->target[i], filename, sizeof(img->target[i]));
-        if (s->io_open(s, &pb[i], img->use_rename ? img->tmp[i] : filename, AVIO_FLAG_WRITE, NULL) < 0) {
+        if (s->io_open(s, &pb[i], img->use_rename ? img->tmp[i] : filename, AVIO_FLAG_WRITE, &options) < 0) {
             av_log(s, AV_LOG_ERROR, "Could not open file : %s\n", img->use_rename ? img->tmp[i] : filename);
             ret = AVERROR(EIO);
+            goto fail;
+        }
+        if (options) {
+            av_log(s, AV_LOG_ERROR, "Could not recognize some protocol options\n");
+            ret = AVERROR(EINVAL);
             goto fail;
         }
 
@@ -210,6 +219,7 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 
 fail:
+    av_dict_free(&options);
     for (i = 0; i < FF_ARRAY_ELEMS(pb); i++)
         if (pb[i])
             ff_format_io_close(s, &pb[i]);
@@ -235,6 +245,7 @@ static const AVOption muxoptions[] = {
     { "strftime",     "use strftime for filename", OFFSET(use_strftime),  AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "frame_pts",    "use current frame pts for filename", OFFSET(frame_pts),  AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "atomic_writing", "write files atomically (using temporary files and renames)", OFFSET(use_rename), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "protocol_opts", "specify protocol options for the opened files", OFFSET(protocol_opts), AV_OPT_TYPE_DICT, {0}, 0, 0, ENC },
     { NULL },
 };
 
@@ -246,10 +257,10 @@ static const AVClass img2mux_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-AVOutputFormat ff_image2_muxer = {
+const AVOutputFormat ff_image2_muxer = {
     .name           = "image2",
     .long_name      = NULL_IF_CONFIG_SMALL("image2 sequence"),
-    .extensions     = "bmp,dpx,jls,jpeg,jpg,ljpg,pam,pbm,pcx,pgm,pgmyuv,png,"
+    .extensions     = "bmp,dpx,exr,jls,jpeg,jpg,ljpg,pam,pbm,pcx,pfm,pgm,pgmyuv,png,"
                       "ppm,sgi,tga,tif,tiff,jp2,j2c,j2k,xwd,sun,ras,rs,im1,im8,im24,"
                       "sunras,xbm,xface,pix,y",
     .priv_data_size = sizeof(VideoMuxData),
@@ -262,7 +273,7 @@ AVOutputFormat ff_image2_muxer = {
 };
 #endif
 #if CONFIG_IMAGE2PIPE_MUXER
-AVOutputFormat ff_image2pipe_muxer = {
+const AVOutputFormat ff_image2pipe_muxer = {
     .name           = "image2pipe",
     .long_name      = NULL_IF_CONFIG_SMALL("piped image2 sequence"),
     .priv_data_size = sizeof(VideoMuxData),
